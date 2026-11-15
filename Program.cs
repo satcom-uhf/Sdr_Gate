@@ -61,7 +61,6 @@ builder.Services.Configure<ForwardedHeadersOptions>(options =>
     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor
                              | ForwardedHeaders.XForwardedProto
                              | ForwardedHeaders.XForwardedHost;
-    // Доверяем локальному reverse-proxy роутера Keenetic
     options.KnownIPNetworks.Clear();
     options.KnownProxies.Clear();
 });
@@ -95,7 +94,6 @@ app.Use(async (ctx, next) =>
         var username = ctx.User.Identity.Name ?? "unknown";
         var ip = ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
 
-        // Если пользователя только что кикнули — отклоняем авто-реконнект OpenWebRx+
         if (store.IsUserKicked(username))
         {
             ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -123,7 +121,8 @@ app.Use(async (ctx, next) =>
     {
         await next();
     }
-});// Страница входа
+});
+// Страница входа
 app.MapGet("/proxy-login", (HttpContext ctx) =>
 {
     var error = ctx.Request.Query.ContainsKey("error")
