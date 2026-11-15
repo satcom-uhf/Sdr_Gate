@@ -30,3 +30,8 @@ Environment=ASPNETCORE_ENVIRONMENT=Production
 [Install]
 WantedBy=multi-user.target
 ```
+
+При первом входе создается дефолтная учетка, не забудьте поменять пароль!
+```
+admin: admin123
+```
