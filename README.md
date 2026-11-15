@@ -10,6 +10,7 @@
 
 Пример настройки службы на порт 8080
 ```
+sudo chmod +x /opt/openwebrx-proxy/SdrGate
 sudo nano /etc/systemd/system/openwebrx-proxy.service
 ```
 
