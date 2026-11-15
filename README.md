@@ -13,6 +13,12 @@
 sudo nano /etc/systemd/system/openwebrx-proxy.service
 ```
 
+Если требуется, положение OpenWebRx можно изменить в appsettings.json
+```
+"Address": "http://127.0.0.1:8073"
+```
+
+
 ```
 [Unit]
 Description=OpenWebRx+ Reverse Proxy
