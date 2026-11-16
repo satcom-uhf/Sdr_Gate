@@ -14,12 +14,6 @@ sudo chmod +x /opt/openwebrx-proxy/SdrGate
 sudo nano /etc/systemd/system/openwebrx-proxy.service
 ```
 
-Если требуется, положение OpenWebRx можно изменить в appsettings.json
-```
-"Address": "http://127.0.0.1:8073"
-```
-
-
 ```
 [Unit]
 Description=OpenWebRx+ Reverse Proxy
@@ -37,7 +31,10 @@ Environment=ASPNETCORE_ENVIRONMENT=Production
 [Install]
 WantedBy=multi-user.target
 ```
-
+Если требуется, положение OpenWebRx можно изменить в appsettings.json
+```
+"Address": "http://127.0.0.1:8073"
+```
 При первом входе создается дефолтная учетка, не забудьте поменять пароль!
 ```
 admin: admin123
