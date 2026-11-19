@@ -11,6 +11,7 @@ public class ProxyStateStore
     private readonly PasswordHasher<string> _hasher = new();
     private StoredData _data;
     private readonly ConcurrentDictionary<string, ActiveSession> _active = new();
+    private readonly ConcurrentDictionary<string, DateTime> _userOnlineSince = new(); // Время входа первого сокета
     private readonly ConcurrentDictionary<string, DateTime> _kickedUntil = new();
 
     public ProxyStateStore()
@@ -86,58 +87,79 @@ public class ProxyStateStore
     {
         lock (_lock) return _data.Users.ContainsKey(username);
     }
+
     public string StartSession(string username, string ip, CancellationTokenSource cts)
     {
         var id = Guid.NewGuid().ToString("N");
-        _active[id] = new ActiveSession(id, username, ip, DateTime.UtcNow, cts);
+        var now = DateTime.UtcNow;
+
+        lock (_lock)
+        {
+            // Если это первый активный сокет пользователя — фиксируем старт реального прослушивания
+            if (!_active.Values.Any(s => s.Username == username))
+            {
+                _userOnlineSince[username] = now;
+            }
+            _active[id] = new ActiveSession(id, username, ip, now, cts);
+        }
+
         return id;
     }
+
     public void EndSession(string id)
     {
-        if (_active.TryRemove(id, out var session))
+        if (!_active.TryRemove(id, out var session)) return;
+
+        var endUtc = DateTime.UtcNow;
+
+        lock (_lock)
         {
-            var endUtc = DateTime.UtcNow;
-            var totalDuration = (endUtc - session.StartedAt).TotalSeconds;
+            // Если у пользователя ещё остались другие открытые сокеты (из тех 5 штук) — время пока не фиксируем
+            if (_active.Values.Any(s => s.Username == session.Username))
+                return;
+
+            // Закрылся последний сокет пользователя — берём реальное время старта первого сокета
+            if (!_userOnlineSince.TryRemove(session.Username, out var realStartUtc))
+                realStartUtc = session.StartedAt;
+
+            var totalDuration = (endUtc - realStartUtc).TotalSeconds;
             if (totalDuration <= 1) return;
 
-            lock (_lock)
+            // 1. Обновляем общее время за всё время
+            _data.TotalListeningSeconds.TryGetValue(session.Username, out var currentTotal);
+            _data.TotalListeningSeconds[session.Username] = currentTotal + totalDuration;
+
+            // 2. Разбиваем реальный интервал по календарным дням
+            var cursor = realStartUtc.ToLocalTime();
+            var endLocal = endUtc.ToLocalTime();
+
+            while (cursor < endLocal)
             {
-                // 1. Обновляем общее время за всё время
-                _data.TotalListeningSeconds.TryGetValue(session.Username, out var currentTotal);
-                _data.TotalListeningSeconds[session.Username] = currentTotal + totalDuration;
+                var nextMidnight = cursor.Date.AddDays(1);
+                var sliceEnd = endLocal < nextMidnight ? endLocal : nextMidnight;
+                var sliceSeconds = (sliceEnd - cursor).TotalSeconds;
 
-                // 2. Разбиваем сессию по локальным календарным дням (на случай перехода через полночь)
-                var cursor = session.StartedAt.ToLocalTime();
-                var endLocal = endUtc.ToLocalTime();
-
-                while (cursor < endLocal)
+                var dayKey = cursor.ToString("yyyy-MM-dd");
+                if (!_data.DailyListeningSeconds.TryGetValue(dayKey, out var dayDict))
                 {
-                    var nextMidnight = cursor.Date.AddDays(1);
-                    var sliceEnd = endLocal < nextMidnight ? endLocal : nextMidnight;
-                    var sliceSeconds = (sliceEnd - cursor).TotalSeconds;
-
-                    var dayKey = cursor.ToString("yyyy-MM-dd");
-                    if (!_data.DailyListeningSeconds.TryGetValue(dayKey, out var dayDict))
-                    {
-                        dayDict = new Dictionary<string, double>();
-                        _data.DailyListeningSeconds[dayKey] = dayDict;
-                    }
-
-                    dayDict.TryGetValue(session.Username, out var dayCurrent);
-                    dayDict[session.Username] = dayCurrent + sliceSeconds;
-
-                    cursor = sliceEnd;
-                }
-                // Удаляем записи старше 60 дней (2 месяцев)
-                var cutoffDay = DateTime.Now.Date.AddDays(-60).ToString("yyyy-MM-dd");
-                foreach (var oldKey in _data.DailyListeningSeconds.Keys.Where(k => string.CompareOrdinal(k, cutoffDay) < 0).ToList())
-                {
-                    _data.DailyListeningSeconds.Remove(oldKey);
+                    dayDict = new Dictionary<string, double>();
+                    _data.DailyListeningSeconds[dayKey] = dayDict;
                 }
 
-                Save();
-                Save();
+                dayDict.TryGetValue(session.Username, out var dayCurrent);
+                dayDict[session.Username] = dayCurrent + sliceSeconds;
+
+                cursor = sliceEnd;
             }
+
+            // 3. Очищаем записи старше 60 дней
+            var cutoffDay = DateTime.Now.Date.AddDays(-60).ToString("yyyy-MM-dd");
+            foreach (var oldKey in _data.DailyListeningSeconds.Keys.Where(k => string.CompareOrdinal(k, cutoffDay) < 0).ToList())
+            {
+                _data.DailyListeningSeconds.Remove(oldKey);
+            }
+
+            Save();
         }
     }
     public void KickSession(string id, int cooldownSeconds = 15)
@@ -145,7 +167,7 @@ public class ProxyStateStore
         if (_active.TryGetValue(id, out var session))
         {
             _kickedUntil[session.Username] = DateTime.UtcNow.AddSeconds(cooldownSeconds);
-            try { session.Cts.Cancel(); } catch { }
+            KickUserSessions(session.Username); // Разрываем все 5 сокетов этого пользователя сразу
         }
     }
     public void KickUserSessions(string username)
@@ -165,7 +187,7 @@ public class ProxyStateStore
         return false;
     }
     public List<ActiveSession> GetActiveSessions() => _active.Values.OrderBy(s => s.StartedAt).ToList();
-
+    public Dictionary<string, DateTime> GetActiveUsersStartTimes() => new(_userOnlineSince);
     public Dictionary<string, Dictionary<string, double>> GetDailyStatsWithActive()
     {
         var result = new Dictionary<string, Dictionary<string, double>>();
@@ -176,11 +198,10 @@ public class ProxyStateStore
                 result[day] = new Dictionary<string, double>(users);
         }
 
-        // Добавляем время текущих онлайн-сессий к сегодняшнему (и вчерашнему, если сидит со вчера) дню
         var nowLocal = DateTime.Now;
-        foreach (var session in _active.Values)
+        foreach (var (username, startUtc) in _userOnlineSince)
         {
-            var cursor = session.StartedAt.ToLocalTime();
+            var cursor = startUtc.ToLocalTime();
             while (cursor < nowLocal)
             {
                 var nextMidnight = cursor.Date.AddDays(1);
@@ -193,8 +214,8 @@ public class ProxyStateStore
                     result[dayKey] = dayDict;
                 }
 
-                dayDict.TryGetValue(session.Username, out var cur);
-                dayDict[session.Username] = cur + (sliceEnd - cursor).TotalSeconds;
+                dayDict.TryGetValue(username, out var cur);
+                dayDict[username] = cur + (sliceEnd - cursor).TotalSeconds;
                 cursor = sliceEnd;
             }
         }

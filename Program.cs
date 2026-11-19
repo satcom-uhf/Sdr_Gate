@@ -61,6 +61,7 @@ builder.Services.Configure<ForwardedHeadersOptions>(options =>
     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor
                              | ForwardedHeaders.XForwardedProto
                              | ForwardedHeaders.XForwardedHost;
+    // Доверяем локальному reverse-proxy роутера Keenetic
     options.KnownIPNetworks.Clear();
     options.KnownProxies.Clear();
 });
@@ -94,6 +95,7 @@ app.Use(async (ctx, next) =>
         var username = ctx.User.Identity.Name ?? "unknown";
         var ip = ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
 
+        // Если пользователя только что кикнули — отклоняем авто-реконнект OpenWebRx+
         if (store.IsUserKicked(username))
         {
             ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -121,8 +123,7 @@ app.Use(async (ctx, next) =>
     {
         await next();
     }
-});
-// Страница входа
+});// Страница входа
 app.MapGet("/proxy-login", (HttpContext ctx) =>
 {
     var error = ctx.Request.Query.ContainsKey("error")
@@ -188,7 +189,7 @@ app.MapGet("/change-password", (HttpContext ctx) =>
     var error = ctx.Request.Query.ContainsKey("error")
         ? "<p style='color:#ff5555;'>Текущий пароль неверен или пароли не совпадают</p>"
         : "";
-    var backLink = username == "admin" ? "/admin" : "/";
+    var backLink = username == "admin" ? "/proxy-admin" : "/";
 
     return Results.Content($$"""
     <!DOCTYPE html>
@@ -244,7 +245,7 @@ app.MapPost("/change-password", async (HttpContext ctx, ProxyStateStore store) =
     return Results.Redirect("/proxy-login");
 }).RequireAuthorization();
 // Панель администратора
-app.MapGet("/admin", (HttpContext ctx, ProxyStateStore store) =>
+app.MapGet("/proxy-admin", (HttpContext ctx, ProxyStateStore store) =>
 {
     if (ctx.User.Identity?.Name != "admin") return Results.Forbid();
 
@@ -276,23 +277,27 @@ app.MapGet("/admin", (HttpContext ctx, ProxyStateStore store) =>
                 <td>{s.StartedAt.ToLocalTime():HH:mm:ss}</td>
                 <td>{FormatDuration(DateTime.UtcNow - s.StartedAt)}</td>
                 <td>
-                    <form method='post' action='/admin/sessions/kick' style='margin:0;'>
+                    <form method='post' action='/proxy-admin/sessions/kick' style='margin:0;'>
                         <input type='hidden' name='sessionId' value='{WebUtility.HtmlEncode(s.Id)}'/>
                         <button type='submit' class='btn-kick'>Отключить</button>
                     </form>
                 </td>
             </tr>
             """));
+    var activeUserStarts = store.GetActiveUsersStartTimes();
 
     var userRows = string.Join("", users.Select(u =>
     {
         var totalSec = stats.GetValueOrDefault(u.Key, 0);
-        var activeSec = activeSessions.Where(s => s.Username == u.Key).Sum(s => (DateTime.UtcNow - s.StartedAt).TotalSeconds);
+        
+        var activeSec = activeUserStarts.TryGetValue(u.Key, out var startUtc)
+            ? (DateTime.UtcNow - startUtc).TotalSeconds
+            : 0;
         var totalFormatted = FormatDuration(TimeSpan.FromSeconds(totalSec + activeSec));
 
         var deleteBtn = u.Key == "admin"
             ? "<span style='color:#666;'>нельзя удалить</span>"
-            : $"<form method='post' action='/admin/users/delete' style='margin:0;'><input type='hidden' name='username' value='{WebUtility.HtmlEncode(u.Key)}'/><button type='submit' class='btn-del'>Удалить</button></form>";
+            : $"<form method='post' action='/proxy-admin/users/delete' style='margin:0;'><input type='hidden' name='username' value='{WebUtility.HtmlEncode(u.Key)}'/><button type='submit' class='btn-del'>Удалить</button></form>";
 
         return $"<tr><td><b>{WebUtility.HtmlEncode(u.Key)}</b></td><td>{totalFormatted}</td><td>{deleteBtn}</td></tr>";
     }));
@@ -330,7 +335,7 @@ app.MapGet("/admin", (HttpContext ctx, ProxyStateStore store) =>
                 <a href="/change-password">Сменить мой пароль</a>
                 <a href="/">← К приёмнику</a>
                 <a href="/settings">← Настройки приемника</a>
-                <a href="/admin">Обновить</a>
+                <a href="/proxy-admin">Обновить</a>
                 <a href="/proxy-logout" style="color:#ff7777;">Выйти</a>
             </div>
         </div>
@@ -350,7 +355,7 @@ app.MapGet("/admin", (HttpContext ctx, ProxyStateStore store) =>
                 <tbody>{{userRows}}</tbody>
             </table>
 
-            <form method="post" action="/admin/users/add" class="add-form">
+            <form method="post" action="/proxy-admin/users/add" class="add-form">
                 <input type="text" name="username" placeholder="Новый логин" required />
                 <input type="password" name="password" placeholder="Пароль" required />
                 <button type="submit">Добавить пользователя</button>
@@ -369,7 +374,7 @@ app.MapGet("/admin", (HttpContext ctx, ProxyStateStore store) =>
 }).RequireAuthorization();
 
 // Принудительный разрыв WebSocket-сессии
-app.MapPost("/admin/sessions/kick", async (HttpContext ctx, ProxyStateStore store) =>
+app.MapPost("/proxy-admin/sessions/kick", async (HttpContext ctx, ProxyStateStore store) =>
 {
 if (ctx.User.Identity?.Name != "admin") return Results.Forbid();
     var form = await ctx.Request.ReadFormAsync();
@@ -377,9 +382,9 @@ if (ctx.User.Identity?.Name != "admin") return Results.Forbid();
     store.KickSession(sessionId);
     // Небольшая пауза, чтобы блок finally успел удалить сессию из словаря до редиректа
     await Task.Delay(100);
-    return Results.Redirect("/admin");
+    return Results.Redirect("/proxy-admin");
 }).RequireAuthorization();
-app.MapPost("/admin/users/add", async (HttpContext ctx, ProxyStateStore store) =>
+app.MapPost("/proxy-admin/users/add", async (HttpContext ctx, ProxyStateStore store) =>
 {
     if (ctx.User.Identity?.Name != "admin") return Results.Forbid();
     var form = await ctx.Request.ReadFormAsync();
@@ -389,10 +394,10 @@ app.MapPost("/admin/users/add", async (HttpContext ctx, ProxyStateStore store) =
     {
         store.AddOrUpdateUser(username, password);
     }
-    return Results.Redirect("/admin");
+    return Results.Redirect("/proxy-admin");
 }).RequireAuthorization();
 // Удаление пользователя + разрыв всех его текущих сессий
-app.MapPost("/admin/users/delete", async (HttpContext ctx, ProxyStateStore store) =>
+app.MapPost("/proxy-admin/users/delete", async (HttpContext ctx, ProxyStateStore store) =>
 {
     if (ctx.User.Identity?.Name != "admin") return Results.Forbid();
     var form = await ctx.Request.ReadFormAsync();
@@ -402,7 +407,7 @@ app.MapPost("/admin/users/delete", async (HttpContext ctx, ProxyStateStore store
         store.DeleteUser(username);
         store.KickUserSessions(username);
     }
-    return Results.Redirect("/admin");
+    return Results.Redirect("/proxy-admin");
 }).RequireAuthorization();
 app.MapReverseProxy();
 app.Run();
