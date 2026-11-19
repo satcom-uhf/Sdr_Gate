@@ -1,4 +1,4 @@
-<img width="1408" height="768" alt="изображение" src="https://github.com/user-attachments/assets/c287e05d-d471-4489-a02b-c4985d906987" />
+<img width="1408" height="768" alt="изображение" src="gate.jpg" />
 
 Прокси с функцией администрирования для OpenWebRx и аналогичных онлайн-приемников.
 
